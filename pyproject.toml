@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedge"
+version = "1.0.0"
+description = "Hierarchical Federated Learning with SCAFFOLD and FedProx for CIFAR-10"
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.18.0",
+    "torch>=2.1",
+    "torchvision>=0.15",
+    "scikit-learn>=1.4.2",
+    "pandas>=2.2.0",
+    "filelock>=3.13.0",
+    "psutil>=5.9.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "toml>=0.10.2",
+    "pillow>=9.0.0"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+# Core Hierarchical FL Configuration
+[tool.flwr.hierarchy]
+num_servers = 3
+clients_per_server = [5, 5, 5]
+global_rounds = 150
+server_rounds_per_global = 1
+cloud_port = 6000
+server_base_port = 5000
+weight_decay = 0.0001
+clip_norm = 1.0
+momentum = 0.9
+lr_gamma = 0.99
+prox_mu = 0.001
+prox_mu_min = 0.0001
+acc_stable_threshold = 0.002
+loss_delta = 0.002
+
+# Dataset
+dataset_flag = "cifar10"
+
+# SCAFFOLD + FedProx parameters
+scaffold_enabled = true
+
+# Learning parameters
+lr_init = 0.01
+server_lr = 1.0
+global_lr = 1.0
+local_epochs = 1
+es_delta = 0.001
+es_patience = 5
+
+# Accuracy gate (0.0 = accept all improvements)
+cluster_better_delta = 0.0
+
+# Evaluation
+eval_batch_size = 32
+estimation_batch_size = 32
+
+# Dirichlet Partitioning
+[tool.flwr.hierarchy.dirichlet]
+alpha_server = 10.0  # Higher alpha = more balanced server distributions
+alpha_client = 0.7  # Higher alpha = more balanced client distributions  
+seed         = 123   # Different seed for more balanced sample allocation
+
+
+# Cloud Clustering Configuration
+[tool.flwr.cloud_cluster]
+enable = true
+start_round = 1                  # clustering begins from round 3 (after stabilization)
+frequency = 1                    # cluster every cloud round
+method = "cosine_similarity"     # Pure cosine similarity clustering (no agglomerative)
+tau = 0.01                       # Similarity threshold: merge if abs(cosine_sim) >= tau
+
+# System Configuration
+[tool.flwr.cluster.batch_sizes]
+logit_batch = 256
+feature_batch = 256
+
+[tool.flwr.system]
+max_workers = 4
+log_level = "INFO"
+communication_timeout = 300
+max_retries          = 3
+gc_frequency         = 10
+verbose_logging      = true

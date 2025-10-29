@@ -1,623 +1,689 @@
 # cloud_flower.py
+# OPTIMIZED VERSION - Dynamic clustering every round, no redundant evaluations
 """
-Cloud server script for hierarchical federated learning using Flower ≥1.13.
-This script starts a Flower ServerApp with communication-cost modifiers,
-writes communication metrics to CSV after completion, and handles
-dynamic clustering and signal files.
+Cloud server for hierarchical FL with dynamic clustering.
+
+Key features:
+- Clustering EVERY round based on similarity (dynamic clusters)
+- No global model evaluation after round 1 (not used)
+- No cluster evaluations (servers already evaluated)
+- Each server gets ONLY its cluster model (no fallback)
+- Fixed race conditions and None parameter issues
 """
 
-# Suppress warnings
-import warnings
-import sys
 import os
+import sys
+import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", module="flwr")
-warnings.simplefilter("ignore")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GRPC_TRACE", "")
 
-# Set environment variable to suppress gRPC warnings
-os.environ["GRPC_VERBOSITY"] = "ERROR"
-os.environ["GRPC_TRACE"] = ""
+# Ensure project root on sys.path
 
-import time
+
+import csv
 import json
 import pickle
-import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-import toml
 import numpy as np
-
-from flwr.server import start_server, ServerConfig
-from flwr.common import Metrics, Parameters, NDArrays
-from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
+import toml
+import torch
+from flwr.common import NDArrays, Parameters, ndarrays_to_parameters, parameters_to_ndarrays, FitIns
+from flwr.common.typing import Properties
+from flwr.server import ServerConfig, start_server
 from flwr.server.strategy import FedAvg
-from fedge.task import Net, get_weights, set_weights, test, get_cifar10_test_loader
-from fedge.cluster_utils import cifar10_weight_clustering
-from fedge.utils.cloud_metrics import get_cloud_metrics_collector
 
-def create_signal_file(signal_path: Path, message: str) -> None:
-    """Create a signal file with the given message."""
+from fedge.task import Net, get_weights, set_weights
+from fedge.utils.cluster_utils import cifar10_weight_clustering
+# Flower compatibility: PropertiesIns exists in newer versions; older versions don’t have it
+try:
+    from flwr.common import PropertiesIns  # newer API
+except Exception:
+    PropertiesIns = None                   # older API path
+
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("cloud")
+
+    
+# Ensure project root on sys.path AND pin CWD to repo
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+os.chdir(PROJECT_ROOT)  # <<< critical: make all relative paths land in the repo
+
+# ─────────────────────── Helper Functions ───────────────────────
+def _signals_dir() -> Path:
+    p = PROJECT_ROOT / "signals"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _metrics_dir() -> Path:
+    p = PROJECT_ROOT / "metrics" / "cloud"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _round_dir(r: int) -> Path:
+    return PROJECT_ROOT / "rounds" / f"round_{r}"
+
+def _write_signal(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        signal_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(signal_path, "w") as f:
+        with open(path, "w") as f:
             f.write(f"{message}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
-        print(f"[Cloud Server] Failed to create signal file {signal_path}: {e}")
+        logger.error(f"Failed to write signal {path}: {e}")
 
-def setup_logging():
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)-8s %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    return logging.getLogger(__name__)
 
-logger = setup_logging()
+def _append_csv(path: Path, fieldnames: List[str], row: Dict[str, Any]) -> None:
+    write_header = not path.exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k) for k in fieldnames})
 
-# Global evaluation function
-def evaluate_global_model(server_round: int, parameters_ndarrays: NDArrays, config: Dict[str, Any]) -> Optional[Tuple[float, Dict[str, Any]]]:
-    """Evaluate the global model on CIFAR-10 test set once per round."""
-    try:
-        # Reconstruct global model from parameters
-        model = Net()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        
-        # Set model parameters
-        params_dict = zip(model.state_dict().keys(), parameters_ndarrays)
-        state_dict = {k: torch.tensor(v) for k, v in params_dict}
-        model.load_state_dict(state_dict, strict=True)
-        
-        # Use CIFAR-10 test dataset - evaluate once per round, not per server
-        test_loader = get_cifar10_test_loader(batch_size=64)
-        
-        # Single evaluation on full CIFAR-10 test set
-        model.eval()
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        
-        with torch.no_grad():
-            for images, labels in test_loader:
-                images = images.to(device)
-                labels = labels.squeeze().long().to(device)
-                outputs = model(images)
-                loss = torch.nn.functional.cross_entropy(outputs, labels, reduction='sum')
-                batch_size = labels.size(0)
-                
-                total_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total_correct += (predicted == labels).sum().item()
-                total_samples += batch_size
-        
-        # Calculate global metrics from single evaluation
-        if total_samples > 0:
-            global_accuracy = total_correct / total_samples
-            global_loss = total_loss / total_samples  # Average loss per sample
-        else:
-            global_accuracy = 0.0
-            global_loss = float('inf')
-        
-        logger.info(f"[Cloud Eval] Global Model: {global_accuracy:.4f} accuracy, {global_loss:.4f} loss, {total_samples} samples")
-        
-        # Return metrics in the format expected by Flower
-        metrics = {
-            "accuracy": global_accuracy,
-            "loss": global_loss,
-            "samples": total_samples,
-            "round": server_round
-        }
-        
-        return global_loss, metrics
-            
-    except Exception as e:
-        logger.error(f"[Cloud Eval] Evaluation failed: {e}")
-        return None
 
+# ─────────────────────── Cloud Strategy ───────────────────────
 class CloudFedAvg(FedAvg):
-    """FedAvg strategy with cloud-tier clustering and logging."""
-    
-    def __init__(self, **kwargs):
-        # Extract cloud clustering configuration
-        cloud_cluster_config = kwargs.pop('cloud_cluster_config', None)
-        # Extract optional model reference for advanced algorithms
-        model_ref = kwargs.pop('model', None)
-        # Extract clustering configuration dict if provided
-        cluster_cfg = kwargs.pop('clustering_config', None)
+    """FedAvg with dynamic clustering every round + per-round client gating"""
+
+    def __init__(self, *args, cloud_cluster_cfg: Optional[Dict] = None, num_servers: Optional[int] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cloud_cluster_cfg = cloud_cluster_cfg or {}
+        self.num_servers = int(num_servers) if num_servers is not None else max(
+            getattr(self, "min_fit_clients", 1),
+            getattr(self, "min_available_clients", 1),
+        )
+
+        # Extract clustering configuration
+        self.clustering_enabled = self.cloud_cluster_cfg.get("enable", False)
+        self.cluster_start = self.cloud_cluster_cfg.get("start_round", 1)
+        self.cluster_frequency = self.cloud_cluster_cfg.get("frequency", 1)
+        self.cluster_method = self.cloud_cluster_cfg.get("method", "cosine_similarity")
+        self.cluster_tau = self.cloud_cluster_cfg.get("tau", 0.01)
+
+        logger.info(f"[Cloud Strategy] Clustering enabled: {self.clustering_enabled}")
+        if self.clustering_enabled:
+            logger.info(
+                f"[Cloud Strategy] Clustering config: method={self.cluster_method}, "
+                f"tau={self.cluster_tau}, start={self.cluster_start}, frequency={self.cluster_frequency}"
+            )
+
+    def _expected_node_ids(self, server_round: int) -> List[str]:
+        # Proxies set: FLWR_CLIENT_NODE_ID = f"s{sid}_g{global_round}"
+        return [f"s{sid}_g{server_round}" for sid in range(self.num_servers)]
         
-        # Pass evaluation function to parent
-        kwargs['evaluate_fn'] = evaluate_global_model
-        super().__init__(**kwargs)
-        
-        # Cloud clustering configuration - enable clustering from round 1
-        ccfg = cloud_cluster_config or {}
-        self.cloud_cluster_config = ccfg
-        self._cluster_tau = float(ccfg.get("tau", 0.7))
-        self._cloud_cluster_enable = bool(ccfg.get("enable", True))  # Default enabled
-        self._start_round = int(ccfg.get("start_round", 1))  # Start from round 1
-        self._frequency = max(1, int(ccfg.get("frequency", 1)))  # Every round
-        self._model = model_ref  # torch.nn.Module instance
-        
-        # Cloud clustering state
-        self._current_round = 0
-        self._cluster_log_data = []
-        self._cluster_assignments = {}
-        self._reference_set = None
-        
-        if self._cloud_cluster_enable:
-            logger.info(f"[Cloud] Clustering enabled: start_round={self._start_round}, frequency={self._frequency}")
-        else:
-            logger.info(f"[Cloud] Clustering DISABLED in config: {ccfg}")
-    
-    def _get_server_id_from_fit_result(self, fit_result) -> Optional[int]:
-        """Extract server ID from fit result metrics."""
+
+    def _refresh_properties(self, client_manager, server_round: int):
+        """Populate cid<->node_id maps *strictly* from per-round node_id (s{sid}_g{server_round}).
+        Any client without a valid node_id for THIS round is ignored.
+        """
+        # Collect connected clients (Flower API is version-dependent)
         try:
-            metrics = fit_result.metrics
-            # Try multiple property names that the proxy client sends
-            for prop_name in ["server_id", "sid", "node_id", "client_id", "partition_id"]:
-                if prop_name in metrics:
-                    return int(metrics[prop_name])
+            all_clients = client_manager.all() if hasattr(client_manager, "all") else {}
+        except Exception:
+            all_clients = {}
+
+        # Init maps once
+        if not hasattr(self, "_cid_to_node"):
+            self._cid_to_node, self._node_to_cid = {}, {}
+
+        # Only accept node_ids that belong to THIS round
+        expected = set(self._expected_node_ids(server_round))
+
+        # Prepare PropertiesIns for newer Flower; otherwise accept plain dicts
+        try:
+            from flwr.common import PropertiesIns as _PI
+        except Exception:
+            _PI = None
+        props_ins = _PI(config={}) if _PI is not None else None
+
+        # Helper: derive node_id from a properties dict
+        def _derive_node_id(props: dict) -> str | None:
+            if not isinstance(props, dict):
+                return None
+            nid = props.get("node_id")
+            if isinstance(nid, str):
+                return nid
+            sid = props.get("server_id")
+            grd = props.get("global_round")
+            try:
+                if sid is not None and grd is not None:
+                    return f"s{int(sid)}_g{int(grd)}"
+            except Exception:
+                pass
+            alt = props.get("client_name") or props.get("name")
+            if isinstance(alt, str):
+                return alt
             return None
-        except Exception as exc:
-            logger.error(f"[Cloud Server] Failed to get server_id from fit result: {exc}")
-            return None
-    
+
+        for cid, cp in list(all_clients.items()):
+            # Fetch properties with broad signature compatibility
+            props = None
+            try:
+                if props_ins is None:
+                    for call in (
+                        lambda: cp.get_properties(timeout=10.0),
+                        lambda: cp.get_properties({}, timeout=10.0),
+                        lambda: cp.get_properties(config={}, timeout=10.0),
+                        lambda: cp.get_properties({}),
+                        lambda: cp.get_properties(),
+                    ):
+                        try:
+                            props = call()
+                            break
+                        except TypeError:
+                            continue
+                else:
+                    try:
+                        res = cp.get_properties(props_ins, timeout=10.0)      # positional
+                    except TypeError:
+                        res = cp.get_properties(ins=props_ins, timeout=10.0)  # keyword
+                    props = getattr(res, "properties", res)
+            except Exception as e:
+                logger.debug(f"[_refresh_properties] get_properties failed for cid={getattr(cp,'cid',cid)}: {e}")
+                props = None
+
+            if hasattr(props, "properties"):
+                props = props.properties
+
+            node_id = _derive_node_id(props) if isinstance(props, dict) else None
+            if not isinstance(node_id, str):
+                # No usable node_id → ignore for gating
+                continue
+
+            if node_id not in expected:
+                # Not a proxy for THIS round → ignore
+                continue
+
+            # Update maps (idempotent)
+            self._cid_to_node[cid] = node_id
+            self._node_to_cid[node_id] = cid
+
+        return all_clients
+
+
+    def configure_fit(self, server_round: int, parameters, client_manager):
+        import os, time
+        from pathlib import Path
+
+        expected_ids = [f"s{i}_g{server_round}" for i in range(self.num_servers)]
+        logger.info(f"[Cloud Round {server_round}] ENTER configure_fit (expected={expected_ids})")
+
+        # --- Settings (env/attrs) ---
+        timeout_sec = getattr(self, "proxy_wait_timeout_sec", 120)
+        adaptive_extend_sec = int(os.getenv("CLOUD_ADAPTIVE_EXTEND_SEC", "600"))
+        log_every = float(os.getenv("CLOUD_HEARTBEAT_LOG_EVERY_SEC", "5.0"))
+        sleep_step = float(os.getenv("CLOUD_WAIT_POLL_SEC", "0.5"))
+
+        # Optional guard rails via files
+        shutdown_file = Path("signals/shutdown_requested.signal")
+        crash_file = Path("signals/cloud_crashed.signal")
+        signals_dir = Path("signals")
+        round_dir = signals_dir / f"round_{server_round}"
+
+        deadline = None if timeout_sec is None or timeout_sec <= 0 else (time.monotonic() + timeout_sec)
+        last_log = 0.0
+        connected_once = set()
+        last_present_count = -1
+        last_missing_count = -1
+        last_done_servers = tuple()
+
+        def _server_completions():
+            done = []
+            for i in range(self.num_servers):
+                f = round_dir / f"server_{i}_completion.signal"
+                if f.exists():
+                    done.append(i)
+            return tuple(done)
+
+        def _snapshot_presence():
+            # (Re)build node_id maps if possible. If props aren’t supported, maps may stay empty.
+            try:
+                _ = self._refresh_properties(client_manager, server_round=server_round)
+            except Exception as e:
+                logger.debug(f"[Cloud Round {server_round}] refresh_properties failed: {e}")
+            node_to_cid = getattr(self, "_node_to_cid", {})
+            present = [nid for nid in expected_ids if nid in node_to_cid]
+            missing = [nid for nid in expected_ids if nid not in node_to_cid]
+            all_clients = client_manager.all() or {}
+            return all_clients, present, missing
+
+        # Helper: count per-round proxy heartbeats (created by proxies before dialing)
+        def _hb_ready():
+            hb_dir = signals_dir / "proxies"
+            try:
+                need = {f"s{i}_g{server_round}.hb" for i in range(self.num_servers)}
+                have = set(p.name for p in hb_dir.glob(f"s*_g{server_round}.hb"))
+                return need.issubset(have)
+            except Exception:
+                return False
+
+        # ── Wait loop (with adaptive extension on first-time connects) ─────────
+        while True:
+            now = time.monotonic()
+            available, present, missing = _snapshot_presence()
+            hb_all = _hb_ready()
+            newly_seen = [nid for nid in present if nid not in connected_once]
+            if newly_seen:
+                connected_once.update(newly_seen)
+                if deadline is not None:
+                    deadline += adaptive_extend_sec
+                    logger.info(
+                        f"[Cloud Round {server_round}] progress: {len(connected_once)}/{self.num_servers} proxies connected; "
+                        f"extended deadline by {adaptive_extend_sec}s"
+                    )
+
+            present_count = len(present)
+            missing_count = len(missing)
+            done_servers = _server_completions()
+
+            # Rate-limited heartbeat
+            if (
+                present_count != last_present_count
+                or missing_count != last_missing_count
+                or done_servers != last_done_servers
+                or (log_every > 0 and (now - last_log) >= log_every)
+            ):
+                logger.info(
+                    f"[Cloud Round {server_round}] heartbeat: present={present_count} "
+                    f"all_clients={len(available)} missing={missing_count} "
+                    f"(server_done={list(done_servers)})"
+                )
+                last_log = now
+                last_present_count = present_count
+                last_missing_count = missing_count
+                last_done_servers = done_servers
+
+            # Exit condition A: all expected proxies identified via node_id
+            if not missing and present_count == self.num_servers:
+                logger.info(f"[Cloud Round {server_round}] ALL expected proxies present (node_id)")
+                break
+
+            # Exit condition B: all leaf servers for this round are done AND heartbeat files exist
+            if set(done_servers) == set(range(self.num_servers)) and hb_all:
+                logger.info(f"[Cloud Round {server_round}] All leaf servers done and heartbeat files present")
+                break
+
+            # Abort flags / timeout
+            if shutdown_file.exists():
+                raise RuntimeError(f"Round {server_round}: shutdown requested; still missing → {missing}")
+            if crash_file.exists():
+                raise RuntimeError(f"Round {server_round}: crash flag present; still missing → {missing}")
+            if deadline is not None and now >= deadline:
+                raise RuntimeError(
+                    f"Round {server_round}: proxies missing after {timeout_sec}s (+{adaptive_extend_sec}s per progress) → {missing}"
+                )
+
+            time.sleep(sleep_step)
+
+        # ── Selection (prefer node_id mapping; fallback allowed only if HB files exist) ───
+        try:
+            _ = self._refresh_properties(client_manager, server_round=server_round)
+        except Exception:
+            pass
+
+        node_to_cid = getattr(self, "_node_to_cid", {})
+        selected_cids = [node_to_cid[nid] for nid in sorted(expected_ids) if nid in node_to_cid]
+
+        clients = []
+        if len(selected_cids) == self.num_servers:
+            # Perfect match via properties
+            for cid in selected_cids:
+                cp = client_manager.get(cid)
+                if cp is not None:
+                    clients.append(cp)
+        else:
+            # Only allow anonymous fallback if HB files say proxies for THIS round exist
+            if _hb_ready():              
+                pool_map = (client_manager.all() or {})
+                if len(pool_map) < self.num_servers:
+                    logger.error(f"[Cloud Round {server_round}] Not enough connected clients for fallback: {len(pool_map)} available")
+                    return []
+                # Prefer newest connections if cids are monotonic / comparable
+                try:
+                    ordered_cids = sorted(pool_map.keys(), reverse=True)
+                    pool = [pool_map[cid] for cid in ordered_cids]
+                except Exception:
+                    pool = list(pool_map.values())
+                clients = pool[: self.num_servers]
+
+                
+                logger.warning(
+                    f"[Cloud Round {server_round}] Using anonymous selection of {len(clients)} clients "
+                    f"(node_id not visible, but heartbeat files confirm round presence)"
+                )
+            else:
+                logger.info(
+                    f"[Cloud Round {server_round}] Waiting for per-round proxies to appear "
+                    f"(no node_id, no heartbeats yet)"
+                )
+                # No clients selected this tick → ask Flower to try again shortly
+                return []
+
+        # Build per-round config WITHOUT calling parent.configure_fit (avoids double dispatch)
+        if hasattr(self, "on_fit_config_fn") and self.on_fit_config_fn is not None:
+            try:
+                base_config = self.on_fit_config_fn(server_round)
+            except TypeError:
+                # Older Flower may not pass the round
+                base_config = self.on_fit_config_fn()
+        else:
+            base_config = {}
+
+        fit_ins = FitIns(parameters=parameters, config=dict(base_config))
+        selected = [(cp, fit_ins) for cp in clients]
+
+        logger.info(
+            f"[Cloud Round {server_round}] ⚡ DISPATCH: sending FitIns to {len(selected)}/{self.num_servers} proxies"
+        )
+        return selected
+
+
+
+
+
     def aggregate_fit(self, server_round: int, results, failures):
-        """Aggregate fit results; optionally perform cloud-tier clustering; save models."""
-        # Use server_round directly (ignore GLOBAL_ROUND env var)
-        global_round = server_round
+        """✅ OPTIMIZED: Dynamic clustering every round, fixed call signature + dual signal paths."""
+        logger.info(f"[Cloud Round {server_round}] aggregate_fit called: results={len(results)} failures={len(failures)}")
+        if not results:
+            logger.error(
+                f"[Cloud Round {server_round}] No results to aggregate. "
+                f"This usually means proxies disconnected before transmitting results. "
+                f"Check: (1) proxy_client.py timing issues, (2) network connectivity, "
+                f"(3) CLOUD_WAIT_CLIENTS_SEC environment variable."
+            )
+            return None
+
+        logger.info(f"[Cloud Round {server_round}] Aggregating {len(results)} server results")
+
+        # 1) Standard FedAvg aggregation via parent
+        aggregation_start = time.time()
+        parent_result = super().aggregate_fit(server_round, results, failures)
+        aggregation_time = time.time() - aggregation_start
+
+        if parent_result is None:
+            logger.error(f"[Cloud Round {server_round}] Parent aggregation failed")
+            return None
+
+        aggregated, metrics = parent_result
+        aggregated_ndarrays = parameters_to_ndarrays(aggregated)
+        logger.info(f"[Cloud Round {server_round}] FedAvg aggregation completed in {aggregation_time:.2f}s")
+
+        # 2) Prepare directories
+        models_dir = PROJECT_ROOT / "models"
+
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        rdir = _round_dir(server_round)
+        gdir = rdir / "global"
+        cdir = rdir / "cloud"
+        gdir.mkdir(parents=True, exist_ok=True)
+        cdir.mkdir(parents=True, exist_ok=True)
+
+        # 3) Save global model
+        global_path = gdir / "model.pkl"
+        with open(global_path, "wb") as f:
+            pickle.dump(aggregated_ndarrays, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copy2(global_path, models_dir / f"model_global_g{server_round}.pkl")
+        logger.debug(f"[Cloud Round {server_round}] Global model saved to {global_path}")
+
+        # 4) Dynamic clustering
+        if self.clustering_enabled:
+            should_cluster = (
+                server_round >= self.cluster_start and
+                (server_round - self.cluster_start) % self.cluster_frequency == 0
+            )
+
+            if should_cluster and len(results) >= 2:
+                try:
+                    clustering_start = time.time()
+                    logger.info(f"[Cloud Round {server_round}] ✅ DYNAMIC CLUSTERING: Performing similarity-based clustering")
+
+                    # --- Build clustering inputs ---
+                    # ───────────────────────────────────────────────────────────────
+                    # --- Build clustering inputs (STRICT: require metrics['server_id']) ---
+                    server_ids: List[int] = []
+                    server_models: Dict[int, List[np.ndarray]] = {}
+                    server_examples: Dict[int, int] = {}
+
+                    for proxy, pr in results:
+                        sid = pr.metrics.get("server_id")
+                        if sid is None:
+                            raise RuntimeError("Missing metrics['server_id'] in FitRes (strict mode).")
+                        if isinstance(sid, str):
+                            if not sid.isdigit():
+                                raise RuntimeError(f"Non-numeric metrics['server_id']={sid!r} (strict mode).")
+                            sid = int(sid)
+                        elif not isinstance(sid, (int, np.integer)):
+                            raise RuntimeError(f"Invalid metrics['server_id'] type={type(sid).__name__} (strict mode).")
+
+                        sid = int(sid)
+                        server_ids.append(sid)
+                        server_models[sid] = parameters_to_ndarrays(pr.parameters)
+                        server_examples[sid] = pr.num_examples
+
+                    server_weights_list = [server_models[sid] for sid in server_ids]
+                    global_weights = aggregated_ndarrays
+
+
+
+                    # --- Correct call signature ---
+                    labels, S, _ = cifar10_weight_clustering(
+                        server_weights_list=server_weights_list,
+                        global_weights=global_weights,
+                        reference_imgs=None,
+                        round_num=server_round,
+                        tau=self.cluster_tau,
+                        stability_history=None,
+                    )
+
+                    assignments = {sid: int(labels[i]) for i, sid in enumerate(server_ids)}
+                    clustering_time = time.time() - clustering_start
+                    labs = sorted(set(assignments.values()))
+                    logger.info(
+                        f"[Cloud Round {server_round}] Clustering completed: {len(labs)} clusters, "
+                        f"{len(server_ids)} servers, time={clustering_time:.2f}s"
+                    )
+
+                    # --- Save cluster assignments ---
+                    assign_csv = cdir / f"clusters_g{server_round}.csv"
+                    with open(assign_csv, "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(["server_id", "cluster"])
+                        for sid in server_ids:
+                            w.writerow([sid, assignments[sid]])
+                    
+                    # NEW: also write JSON so net_topo can resolve previous cluster per server
+                    assign_json = cdir / f"clusters_g{server_round}.json"
+                    with open(assign_json, "w") as jf:
+                        json.dump({"assignments": {str(sid): int(assignments[sid]) for sid in server_ids}}, jf)
+                    shutil.copy2(assign_json, models_dir / assign_json.name)
+
+                    # --- Save similarity matrix (optional) ---
+                    try:
+                        sim_csv = cdir / f"similarity_g{server_round}.csv"
+                        with open(sim_csv, "w", newline="") as f:
+                            w = csv.writer(f)
+                            w.writerow([""] + [f"server_{sid}" for sid in server_ids])
+                            for i, sid_i in enumerate(server_ids):
+                                row = [f"server_{sid_i}"] + [f"{S[i, j]:.6f}" for j in range(len(server_ids))]
+                                w.writerow(row)
+                        self._last_similarity_matrix = S
+                    except Exception as e:
+                        logger.warning(f"[Cloud Round {server_round}] Could not write similarity CSV: {e}")
+
+                    # --- Create per-cluster aggregated models ---
+                    cluster_creation_start = time.time()
+                    for lab in labs:
+                        members = [sid for sid, labv in assignments.items() if labv == lab]
+                        if not members:
+                            continue
+
+                        total_w = sum(max(1, int(server_examples.get(sid, 0))) for sid in members)
+
+                        cluster_model = None
+                        for sid in members:
+                            w = max(1, int(server_examples.get(sid, 0))) / float(total_w)
+                            weights = server_models[sid]
+                            if cluster_model is None:
+                                cluster_model = [w * np.copy(arr) for arr in weights]
+                            else:
+                                for i in range(len(cluster_model)):
+                                    cluster_model[i] += w * weights[i]
+
+                        cpath = cdir / f"model_cluster{lab}_g{server_round}.pkl"
+                        with open(cpath, "wb") as f:
+                            pickle.dump(cluster_model, f, protocol=pickle.HIGHEST_PROTOCOL)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        shutil.copy2(cpath, models_dir / cpath.name)
+                        logger.info(f"[Cloud Round {server_round}] Cluster {lab} model saved: {cpath.name}")
+
+                    cluster_creation_time = time.time() - cluster_creation_start
+                    logger.debug(f"[Cloud Round {server_round}] Cluster models created in {cluster_creation_time:.2f}s")
+
+                except Exception as e:
+                    logger.error(
+                        f"[Cloud Round {server_round}] Clustering failed: {e.__class__.__name__}: {e}",
+                        exc_info=True,
+                    )
+
+        # 5) Completion signals
+        round_signal = cdir / f"cloud_completed_g{server_round}.signal"
+        _write_signal(round_signal, f"Round {server_round} completed")
+
+        # also write one in signals/ for net_topo
+        signals_dir = _signals_dir()
+        net_topo_signal = signals_dir / f"cloud_round_{server_round}_completed.signal"
+        _write_signal(net_topo_signal, f"Round {server_round} completed")
+
+        logger.info(f"[Cloud Round {server_round}] ✅ Completion signals created")
+
+        return parent_result
+
         
-        logger.info(f"[Cloud] aggregate_fit called: server_round={server_round}, global_round={global_round}, results={len(results)}, failures={len(failures)}")
+    def aggregate_evaluate(self, server_round: int, results, failures):
+        """
+        ✅ FIXED: Simplified - proxy evaluations not needed.
         
+        Servers already evaluated on their own shards before uploading.
+        Proxy evaluating cloud's global model on shards is incorrect.
+        """
         if failures:
-            logger.warning(f"[Cloud Server] {len(failures)} servers failed during training")
+            logger.warning(f"[Cloud Round {server_round}] {len(failures)} proxy eval failures (ignored)")
         
         if not results:
-            logger.warning("[Cloud Server] No results to aggregate")
-            return super().aggregate_fit(server_round, results, failures)
+            logger.debug(f"[Cloud Round {server_round}] No evaluation results (expected - proxies don't eval)")
+            return None, {}
         
-        # 1) Standard FedAvg aggregation across all servers
-        aggregated_params, metrics = super().aggregate_fit(server_round, results, failures)
+        # If we get results, log them but don't use for anything critical
+        logger.debug(f"[Cloud Round {server_round}] Received {len(results)} eval results (informational only)")
+        
+        return None, {}
 
-        # Convert Flower Parameters to list[ndarray] for saving/processing
-        agg_list = parameters_to_ndarrays(aggregated_params) if aggregated_params is not None else None
-        
-        # CRITICAL: Validate aggregated parameters for NaN/inf corruption
-        if agg_list is not None:
-            has_nan = any(np.isnan(arr).any() for arr in agg_list)
-            has_inf = any(np.isinf(arr).any() for arr in agg_list)
-            
-            if has_nan or has_inf:
-                logger.error(f"[Cloud] CRITICAL: Aggregated model contains {'NaN' if has_nan else ''}{'/' if has_nan and has_inf else ''}{'inf' if has_inf else ''} parameters!")
-                logger.error(f"[Cloud] FedAvg aggregation corrupted - using fallback weighted average")
-                
-                # Fallback: Simple weighted average of server models
-                total_samples = sum(fit_result.num_examples for _, fit_result in results)
-                if total_samples > 0:
-                    weighted_sum = None
-                    for _, fit_result in results:
-                        weight = fit_result.num_examples / total_samples
-                        server_params = parameters_to_ndarrays(fit_result.parameters)
-                        
-                        if weighted_sum is None:
-                            weighted_sum = [weight * arr for arr in server_params]
-                        else:
-                            for i, arr in enumerate(server_params):
-                                weighted_sum[i] += weight * arr
-                    
-                    # Validate fallback parameters
-                    if weighted_sum is not None:
-                        fallback_has_nan = any(np.isnan(arr).any() for arr in weighted_sum)
-                        fallback_has_inf = any(np.isinf(arr).any() for arr in weighted_sum)
-                        
-                        if not fallback_has_nan and not fallback_has_inf:
-                            logger.info(f"[Cloud] Fallback weighted average is clean - using as replacement")
-                            agg_list = weighted_sum
-                            aggregated_params = ndarrays_to_parameters(weighted_sum)
-                        else:
-                            logger.error(f"[Cloud] FATAL: Even fallback parameters are corrupted!")
-                            return None, {}
-                else:
-                    logger.error(f"[Cloud] FATAL: No samples to compute fallback!")
-                    return None, {}
-            else:
-                logger.debug(f"[Cloud] Aggregated parameters validated - no NaN/inf detected")
-
-        # Always save the global model using rounds directory structure
-        if agg_list is not None:
-            # Use rounds directory structure as suggested
-            out_dir = Path().resolve() / "rounds" / f"round_{global_round}" / "global"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save as model.pkl in the global directory
-            model_path = out_dir / "model.pkl"
-            with open(model_path, "wb") as f:
-                pickle.dump(agg_list, f)
-            logger.info(f"[Cloud] Saved aggregated global model to {model_path}")
-            
-            # Also save in models/ directory for compatibility (single consistent name)
-            models_dir = Path().resolve() / "models"
-            models_dir.mkdir(parents=True, exist_ok=True)
-            legacy_path = models_dir / f"model_global_g{global_round}.pkl"
-            with open(legacy_path, "wb") as f:
-                pickle.dump(agg_list, f)
-            logger.info(f"[Cloud] Also saved to models directory: {legacy_path}")
-
-        # 2) Cloud-tier clustering (weight-based) if enabled for this round
-        should_cluster = (
-            self._cloud_cluster_enable
-            and global_round >= self._start_round
-            and (global_round - self._start_round) % self._frequency == 0
-        )
-        
-        logger.info(f"[Cloud] Clustering check: enable={self._cloud_cluster_enable}, "
-                   f"round={global_round}, start={self._start_round}, freq={self._frequency}, "
-                   f"should_cluster={should_cluster}")
-        
-        if should_cluster:
-            logger.info(f"[Cloud] *** CLUSTERING TRIGGERED *** at global round {global_round} "
-                        f"(start={self._start_round}, every={self._frequency})")
-            
-            # Extract server models and weights
-            server_models = {}
-            server_weights = {}
-            
-            for client_proxy, fit_result in results:
-                server_id = self._get_server_id_from_fit_result(fit_result)
-                logger.info(f"[Cloud] Processing result from server_id={server_id}, samples={fit_result.num_examples}")
-                if server_id is not None:
-                    server_models[server_id] = parameters_to_ndarrays(fit_result.parameters)
-                    server_weights[server_id] = fit_result.num_examples
-                    logger.info(f"[Cloud] Server {server_id}: {fit_result.num_examples} samples, model params={len(server_models[server_id])}")
-                else:
-                    logger.warning(f"[Cloud] Failed to extract server_id from fit result")
-            
-            logger.info(f"[Cloud] Total server models collected: {len(server_models)} (need >=2 for clustering)")
-            logger.info(f"[Cloud] Server IDs collected: {list(server_models.keys())}")
-            
-            if len(server_models) >= 2:
-                # Perform clustering using cluster_utils
-                from fedge.cluster_utils import cifar10_weight_clustering
-                
-                try:
-                    # Convert server_models dict to list for clustering function
-                    server_ids = sorted(server_models.keys())
-                    server_weights_list = [server_models[sid] for sid in server_ids]
-                    
-                    # Read tau from cloud cluster config
-                    tau = getattr(self, "_cluster_tau", 0.7)
-                    logger.info(f"[Cloud] Using tau = {tau} from config for clustering")
-                    
-                    # Convert aggregated_params to list if it's Parameters type
-                    if aggregated_params is not None:
-                        global_weights = parameters_to_ndarrays(aggregated_params)
-                    else:
-                        global_weights = server_weights_list[0]  # Use first as fallback
-                    
-                    labels, S, tau_sim = cifar10_weight_clustering(
-                        server_weights_list,
-                        global_weights,
-                        None,  # reference_imgs not needed for weight-based clustering
-                        global_round,  # Use global_round consistently
-                        tau
-                    )
-                    cluster_labels_array = labels
-                    
-                    # Surface pairwise similarities in cloud logs for debugging
-                    for i in range(S.shape[0]):
-                        logger.info(f"[Cloud] S[{i}]: " + " ".join(f"{v:.3f}" for v in S[i]))
-                    logger.info(f"[Cloud] similarity_threshold used: {tau_sim:.3f}")
-                    
-                    # Convert cluster labels array to dict mapping server_id -> cluster_label
-                    cluster_map = {server_ids[i]: int(cluster_labels_array[i]) for i in range(len(server_ids))}
-                    unique_labels = set(cluster_map.values())
-                    
-                    logger.info(f"[Cloud] Clustering results: {len(unique_labels)} clusters")
-                    logger.info(f"[Cloud] Cluster assignments: {cluster_map}")
-                    
-                    # Save clustering metrics
-                    metrics_dir = Path().resolve() / "metrics" / "cloud"
-                    metrics_dir.mkdir(parents=True, exist_ok=True)
-                    cluster_metrics_path = metrics_dir / f"clustering_round_{global_round}.json"
-                    with open(cluster_metrics_path, "w") as f:
-                        json.dump({
-                            "round": global_round,
-                            "tau": tau,
-                            "num_clusters": len(unique_labels),
-                            "assignments": cluster_map,
-                            "server_ids": server_ids
-                        }, f, indent=2)
-                    logger.info(f"[Cloud] Saved clustering metrics to {cluster_metrics_path}")
-                    
-                    # Save cluster artifacts using rounds directory structure
-                    cl_dir = Path().resolve() / "rounds" / f"round_{global_round}" / "cloud"
-                    cl_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Save cluster mapping in canonical location and mirror to models/
-                    cluster_json_path = cl_dir / f"clusters_g{global_round}.json"
-                    with open(cluster_json_path, "w", encoding="utf-8") as fp:
-                        json.dump({"round": global_round, "assignments": cluster_map}, fp, indent=2)
-                    logger.info(f"[Cloud] Saved cluster mapping to {cluster_json_path}")
-                    
-                    # Save similarity matrix to file for analysis
-                    similarity_matrix_path = cl_dir / f"similarity_matrix_g{global_round}.csv"
-                    np.savetxt(similarity_matrix_path, S, delimiter=',', fmt='%.6f')
-                    logger.info(f"[Cloud] Saved similarity matrix to {similarity_matrix_path}")
-                    
-                    # Save pairwise similarities as detailed CSV
-                    pairwise_csv_path = cl_dir / f"pairwise_similarities_g{global_round}.csv"
-                    with open(pairwise_csv_path, 'w', newline='') as f:
-                        import csv
-                        writer = csv.writer(f)
-                        writer.writerow(['server_i', 'server_j', 'similarity', 'above_threshold'])
-                        for i in range(len(server_ids)):
-                            for j in range(i+1, len(server_ids)):
-                                sim_val = S[i, j]
-                                above_thresh = sim_val >= tau
-                                writer.writerow([server_ids[i], server_ids[j], f'{sim_val:.6f}', above_thresh])
-                    logger.info(f"[Cloud] Saved pairwise similarities to {pairwise_csv_path}")
-                    
-                    # Mirror to models/ directory for compatibility
-                    models_dir = Path().resolve() / "models"
-                    models_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(cluster_json_path, models_dir / f"clusters_g{global_round}.json")
-                    
-                    # Save cluster-specific models
-                    for lab in unique_labels:
-                        # Get servers in this cluster
-                        cluster_servers = [sid for sid, label in cluster_map.items() if label == lab]
-                        
-                        # Weighted average within cluster
-                        total_weight = sum(server_weights.get(sid, 1) for sid in cluster_servers)
-                        sums = None
-                        
-                        for sid in cluster_servers:
-                            if sid in server_models:
-                                weight = server_weights.get(sid, 1) / total_weight
-                                model_arrays = server_models[sid]
-                                
-                                if sums is None:
-                                    sums = [weight * arr for arr in model_arrays]
-                                else:
-                                    for i, arr in enumerate(model_arrays):
-                                        sums[i] += weight * arr
-                        
-                        if sums is not None:
-                            # Save as plain list for evaluator compatibility
-                            cluster_path = cl_dir / f"model_cluster{lab}_g{global_round}.pkl"
-                            with open(cluster_path, "wb") as f:
-                                pickle.dump(sums, f, protocol=pickle.HIGHEST_PROTOCOL)
-                            logger.info(f"[Cloud] Saved cluster {lab} model to {cluster_path}")
-                            
-                            # Mirror to models/ directory
-                            shutil.copy2(cluster_path, models_dir / cluster_path.name)
-
-                    logger.info(f"[Cloud] *** CLUSTERING COMPLETED *** @ global round {global_round}: K={len(unique_labels)} labels={cluster_map}")
-                    
-                    # Log clustering results for verification
-                    for lab in unique_labels:
-                        cluster_servers = [sid for sid, label in cluster_map.items() if label == lab]
-                        logger.info(f"[Cloud] Cluster {lab}: servers {cluster_servers}")
-                    
-                except Exception as e:
-                    logger.error(f"[Cloud] Clustering failed: {e}, using standard aggregation")
-                    import traceback
-                    logger.error(f"[Cloud] Clustering error traceback: {traceback.format_exc()}")
-            else:
-                logger.warning(f"[Cloud] Not enough servers for clustering: {len(server_models)} < 2")
-        else:
-            logger.info(f"[Cloud] Clustering skipped for round {global_round}")
-
-        logger.info(f"[Cloud] Aggregation completed for global round {global_round}")
-        
-        # Collect cloud-level metrics if clustering was performed
-        if should_cluster and len(server_models) >= 2:
-            try:
-                cloud_metrics_collector = get_cloud_metrics_collector(Path().resolve())
-                
-                # Save cluster composition
-                cloud_metrics_collector.save_cluster_composition(server_round, cluster_map)
-                
-                # Evaluate cluster performance
-                test_loader = get_cifar10_test_loader()
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                
-                cluster_performance = cloud_metrics_collector.evaluate_cluster_performance(
-                    server_round, cluster_map, server_models, server_weights, test_loader, device
-                )
-                
-                # Get global performance for comparison
-                global_accuracy = metrics.get('accuracy', 0.0) if metrics else 0.0
-                global_loss = 0.0  # Will be calculated by evaluate function
-                
-                # Calculate communication cost (approximate)
-                total_comm_cost = sum(fit_result.num_examples * 4594000 for _, fit_result in results)  # Approximate model size
-                
-                # Save comprehensive cloud metrics
-                cloud_metrics_collector.save_cloud_round_metrics(
-                    server_round, cluster_map, cluster_performance, 
-                    global_accuracy, global_loss, total_comm_cost
-                )
-                
-                logger.info(f"[Cloud] Saved comprehensive cloud metrics for round {server_round}")
-                
-            except Exception as e:
-                logger.error(f"[Cloud] Failed to collect cloud metrics: {e}")
-        
-        # Create per-round completion signal for orchestrator synchronization
-        signal_dir = Path().resolve() / "signals"
-        signal_dir.mkdir(exist_ok=True)
-        completion_signal = signal_dir / f"cloud_round_{server_round}_completed.signal"
-        create_signal_file(completion_signal, f"Cloud round {server_round} completed")
-        logger.info(f"[Cloud] Created completion signal: {completion_signal}")
-        
-        return aggregated_params, metrics
-    
-    def aggregate_evaluate(self, server_round: int, results, failures):
-        """Aggregate evaluation results and compute agg_acc correctly."""
-        try:
-            if failures:
-                logger.warning(f"[Cloud] Evaluation failures: {len(failures)}")
-                return None, {"agg_acc": 0.0}
-            
-            if not results:
-                logger.warning(f"[Cloud] No evaluation results to aggregate")
-                return None, {"agg_acc": 0.0}
-            
-            # Compute weighted average accuracy
-            total_examples = 0
-            weighted_accuracy_sum = 0.0
-            
-            for _, eval_res in results:
-                num_examples = getattr(eval_res, "num_examples", 0)
-                accuracy = (eval_res.metrics or {}).get("accuracy", 0.0)
-                
-                weighted_accuracy_sum += accuracy * num_examples
-                total_examples += num_examples
-            
-            agg_acc = (weighted_accuracy_sum / total_examples) if total_examples > 0 else 0.0
-            
-            # Call parent aggregate_evaluate for loss aggregation
-            parent_result = super().aggregate_evaluate(server_round, results, failures)
-            if parent_result is not None:
-                loss, parent_metrics = parent_result
-                parent_metrics = parent_metrics or {}
-                parent_metrics["agg_acc"] = agg_acc
-                return loss, parent_metrics
-            else:
-                return None, {"agg_acc": agg_acc}
-                
-        except Exception as e:
-            logger.error(f"[Cloud Eval] Evaluation failed: {e}")
-            return None, {"agg_acc": 0.0}
-
+# ─────────────────────── Server Runner ───────────────────────
 def run_server():
-    """Run long-running cloud server for all global rounds with dynamic clustering."""
     logger.info("[Cloud Server] Starting long-running cloud aggregation server")
     
-    # Create signal directory
-    signal_dir = Path().resolve() / "signals"
-    signal_dir.mkdir(exist_ok=True)
+    # Signals
+    sigdir = _signals_dir()
+    _write_signal(sigdir / "cloud_started.signal", "Cloud server started")
+    logger.info("[Cloud Server] Start signal created")
     
-    # Get total number of global rounds from environment
-    total_rounds = int(os.getenv('TOTAL_GLOBAL_ROUNDS', '3'))
-    logger.info(f"[Cloud Server] Will handle {total_rounds} global rounds")
+    # Configuration
+    total_rounds = int(os.getenv("TOTAL_GLOBAL_ROUNDS", os.getenv("ROUNDS", "3")))
+    num_servers = int(os.getenv("NUM_SERVERS", "2"))
+    logger.info(f"[Cloud Server] Configuration: {total_rounds} rounds, {num_servers} servers")
     
+    cfg_path = PROJECT_ROOT / "pyproject.toml"
+
+    if not cfg_path.exists():
+        raise FileNotFoundError("pyproject.toml not found")
+    
+    cfg = toml.load(cfg_path)
+    hier = cfg.get("tool", {}).get("flwr", {}).get("hierarchy", {})
+    cloud_cluster_cfg = cfg.get("tool", {}).get("flwr", {}).get("cloud_cluster", {})
+    
+    cloud_port = int(hier.get("cloud_port", os.getenv("CLOUD_PORT", 6000)))
+    
+    # Initial parameters (fresh model)
+    init_model = Net()
+    init_params = ndarrays_to_parameters(get_weights(init_model))
+    logger.info("[Cloud Server] Fresh model parameters initialized")  
+    
+    strategy = CloudFedAvg(
+        fraction_fit=1.0,
+        fraction_evaluate=0.0,          # ✅ No proxy eval
+        min_fit_clients=num_servers,
+        min_evaluate_clients=0,         # ✅ No eval clients
+        min_available_clients=num_servers,
+        initial_parameters=init_params,
+        cloud_cluster_cfg=cloud_cluster_cfg,
+        accept_failures=False,  # ← force waiting for all 3 proxies
+        num_servers=num_servers,         # <-- add this
+    )
+    # ✅ No evaluate_fn (their suggestion)
+
+    # Wait policy: <=0 means infinite; otherwise finite with adaptive extension in configure_fit()
     try:
-        # Log environment variables set by orchestrator
-        num_servers = os.getenv('NUM_SERVERS', '3')
-        logger.info(f"[Cloud Server] Starting for {total_rounds} rounds with {num_servers} servers")
-        
-        # Load configuration
-        config_path = Path("pyproject.toml")
-        if not config_path.exists():
-            raise FileNotFoundError("pyproject.toml not found")
-        
-        # Log working directory and models path for path verification
-        cwd = Path().resolve()
-        logger.info(f"[Cloud Server] Working directory: {cwd}")
-        logger.info(f"[Cloud Server] Models directory: {cwd / 'models'}")
+        strategy.proxy_wait_timeout_sec = int(os.getenv("CLOUD_WAIT_CLIENTS_SEC", "600"))
+    except Exception:
+        strategy.proxy_wait_timeout_sec = 600
+    logger.info(
+        f"[Cloud Server] Proxy wait timeout set to {strategy.proxy_wait_timeout_sec}s "
+        f"({'infinite' if strategy.proxy_wait_timeout_sec <= 0 else 'finite'})"
+    )
 
-        config = toml.load(config_path)
-        
-        # Extract configuration
-        hierarchy_config = config.get("tool", {}).get("flwr", {}).get("hierarchy", {})
-        optimizer_config = config.get("tool", {}).get("flwr", {}).get("optimizer", {})
-        cluster_config = config.get("tool", {}).get("flwr", {}).get("cluster", {})
-        cloud_cluster_cfg = config.get("tool", {}).get("flwr", {}).get("cloud_cluster", {})
-        
-        # CRITICAL FIX: Load previous round's model or create fresh parameters
-        global_round = int(os.getenv('GLOBAL_ROUND', '1'))
-        initial_parameters = None
-        # Initialize model upfront to avoid undefined variable
-        init_model = Net()
-        
-        # Try to load previous round's global model
-        if global_round > 1:
-            prev_round = global_round - 1
-            candidate_paths = [
-                cwd / "rounds" / f"round_{prev_round}" / "global" / "model.pkl",
-                cwd / "models" / f"model_global_g{prev_round}.pkl",
-                cwd / "models" / f"global_model_round_{prev_round}.pkl"
-            ]
-            
-            for model_path in candidate_paths:
-                if model_path.exists():
-                    try:
-                        with open(model_path, "rb") as f:
-                            loaded_data = pickle.load(f)
-                            if isinstance(loaded_data, tuple):
-                                ndarrays = loaded_data[0]
-                            else:
-                                ndarrays = loaded_data
-                        initial_parameters = ndarrays_to_parameters(ndarrays)
-                        # Also set weights on init_model for consistency
-                        set_weights(init_model, ndarrays)
-                        logger.info(f"[Cloud Server] Loaded trained model from round {prev_round}")
-                        break
-                    except Exception as e:
-                        logger.warning(f"[Cloud Server] Failed to load {model_path}: {e}")
-        
-        # If no previous model found, create fresh parameters
-        if initial_parameters is None:
-            initial_parameters = ndarrays_to_parameters(get_weights(init_model))
-            logger.info(f"[Cloud Server] Created fresh model parameters for round {global_round}")
+    server_address = f"0.0.0.0:{cloud_port}"
+    logger.info(f"[Cloud Server] Binding Flower to {server_address} (num_rounds={total_rounds})")
 
-        # Get number of servers from environment (set by orchestrator)
-        num_servers = int(os.getenv('NUM_SERVERS', '3'))
-        
-        # Use CloudFedAvg for CIFAR-10 with optional cloud clustering
-        strategy = CloudFedAvg(
-            fraction_fit=1.0,
-            fraction_evaluate=1.0,
-            min_fit_clients=num_servers,
-            min_evaluate_clients=num_servers,
-            min_available_clients=num_servers,
-            initial_parameters=initial_parameters,
-            clustering_config=cluster_config,
-            cloud_cluster_config=cloud_cluster_cfg,
-            model=init_model,
+    # Write a PID file so we can confirm liveness later
+    try:
+        (_signals_dir() / "cloud_server.pid").write_text(str(os.getpid()))
+    except Exception:
+        pass
+
+    try:
+        history = start_server(
+            server_address=server_address,
+            config=ServerConfig(num_rounds=total_rounds, round_timeout=None),
+            strategy=strategy,
         )
-        # Enforce "all servers must participate"
-        strategy.accept_failures = False
-        
-        # Start server to handle all global rounds
-        logger.info(f"[Cloud Server] Starting on port {hierarchy_config.get('cloud_port', 6000)}")
-        logger.info(f"[Cloud Server] Expecting {num_servers} proxy clients per round")
-        
-        # Create start signal file BEFORE starting server
-        create_signal_file(signal_dir / "cloud_started.signal", "Cloud server started")
-        logger.info("[Cloud Server] Start signal created")
-        
-        # Start server with proper configuration - handle ALL rounds in one go
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            
-            logger.info(f"[Cloud Server] Starting Flower server for {total_rounds} rounds")
-            history = start_server(
-                server_address=f"0.0.0.0:{hierarchy_config.get('cloud_port', 6000)}",
-                config=ServerConfig(
-                    num_rounds=total_rounds,  # Handle ALL rounds in one server instance
-                    round_timeout=300.0,  # 5 minutes timeout per round
-                ),
-                strategy=strategy
-            )
-        
-        logger.info(f"[Cloud Server] All {total_rounds} rounds completed")
+        logger.info("[Cloud Server] start_server() returned normally")
         return history
-        
     except Exception as e:
-        logger.exception(f"[Cloud Server] Unhandled error: {e}")
-        create_signal_file(signal_dir / "cloud_error.signal", f"{e!r}")
+        import traceback
+        crash_path = _signals_dir() / "cloud_crashed.signal"
+        msg = f"Cloud crashed: {e}\n{traceback.format_exc()}"
+        logger.error(msg)
+        _write_signal(crash_path, msg)
         raise
     finally:
-        # Create final completion signal after all rounds
-        create_signal_file(signal_dir / "cloud_all_rounds_completed.signal", "Cloud server completed all rounds")
+        logger.info("[Cloud Server] EXIT run_server()")
+
+    
+    return history
+
 
 if __name__ == "__main__":
     run_server()
+

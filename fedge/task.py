@@ -260,10 +260,91 @@ def get_cifar10_dataset(train: bool = True):
     data = load_cifar10_hf(seed=42)
     return data.train if train else data.test
 
-def get_cifar10_test_loader(batch_size: int = 32) -> DataLoader:
-    """Get CIFAR-10 test DataLoader for global evaluation (torchvision)."""
+
+# ── REPLACE THIS METHOD IN task.py ─────────────────────────────────────────────
+from typing import Optional
+from torch.utils.data import DataLoader
+from pathlib import Path
+import json
+import os
+
+def get_cifar10_test_loader(
+    batch_size: int = 32,
+    server_id: Optional[int] = None,
+    num_servers: Optional[int] = None,
+) -> DataLoader:
+    """
+    STRICT shard-only CIFAR-10 test DataLoader for hierarchical evaluation.
+
+    Requirements:
+      - server_id MUST be provided
+      - num_servers MUST be provided
+      - PARTITIONS_JSON must point to a valid partitions.json (or defaults to PROJECT_ROOT/rounds/partitions.json)
+
+    Behavior:
+      - Builds the test shard for the given server by mapping that server's aggregated
+        *training* indices to proportional *test* indices (as in your existing logic),
+        then de-duplicates while preserving order.
+    """
+    if server_id is None or num_servers is None:
+        raise ValueError("This loader is shard-only: provide both server_id and num_servers.")
+
     data = load_cifar10_hf(seed=42)
-    return make_loader(data.test, batch_size=batch_size, shuffle=False)
+
+    # Locate partitions mapping
+    parts_json = os.getenv("PARTITIONS_JSON")
+    if not parts_json:
+        parts_json = str(PROJECT_ROOT / "rounds" / "partitions.json")
+
+    if not Path(parts_json).exists():
+        logger.error(f"Partition file not found: {parts_json}")
+        # Return an empty loader (strict behavior, no global fallback)
+        return make_loader(subset(data.test, []), batch_size=batch_size, shuffle=False)
+
+    with open(parts_json, "r") as f:
+        mapping = json.load(f)
+
+    sid = str(int(server_id))
+    if sid not in mapping:
+        logger.error(f"Server {server_id} not found in partition mapping: {parts_json}")
+        return make_loader(subset(data.test, []), batch_size=batch_size, shuffle=False)
+
+    # Aggregate all training indices for this server
+    server_train_indices = []
+    for _client_id, client_indices in mapping[sid].items():
+        server_train_indices.extend(client_indices)
+
+    train_size = len(data.train)
+    test_size = len(data.test)
+    if train_size == 0 or test_size == 0:
+        logger.error("Empty train/test split encountered while building test shard.")
+        return make_loader(subset(data.test, []), batch_size=batch_size, shuffle=False)
+
+    # Map training indices to proportional test indices (preserve your original approach)
+    server_test_indices = [
+        min(int(idx * test_size / train_size), test_size - 1)
+        for idx in server_train_indices
+    ]
+
+    # De-duplicate while preserving order
+    seen = set()
+    server_test_indices = [x for x in server_test_indices if not (x in seen or seen.add(x))]
+
+    logger.info(
+        f"[Shard Eval] Server {server_id}/{num_servers} -> "
+        f"{len(server_test_indices)} test samples (from {len(server_train_indices)} train indices)"
+    )
+
+    test_subset = subset(data.test, server_test_indices)
+    return make_loader(
+        test_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+# ───────────────────────────────────────────────────────────────────────────────
+
 
 # Legacy compatibility wrapper
 class CifarDataset(Dataset):

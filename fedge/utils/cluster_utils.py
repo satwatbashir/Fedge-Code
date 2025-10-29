@@ -1,37 +1,56 @@
-"""Utility functions for dynamic server clustering using symmetric KL divergence.
-
-This module is intentionally self-contained so it can be imported by the
-cloud-level strategy without pulling in any Flower-specific dependencies.
-"""
 from __future__ import annotations
 
-import hashlib
-from functools import lru_cache
-from pathlib import Path
-from typing import List, Tuple
-
+from warnings import warn
+from ._batch_cfg_loader import load as _load_batch_cfg
+from typing import List, Tuple, Dict, TYPE_CHECKING
 import numpy as np
 import torch
-import torch.nn.functional as F
-from collections import defaultdict
-# Removed sklearn.cluster import - using pure similarity clustering
+import hashlib
 
-from fedge.task import Net, get_cifar10_test_loader, set_weights  # type: ignore
+if TYPE_CHECKING:
+    from fedge.task import Net
 
-# -----------------------------------------------------------------------------
-# Configuration: Load batch sizes from pyproject.toml (strict, no fallbacks)
-# -----------------------------------------------------------------------------
+
+# Load batch-size config robustly; never crash at import time.
 try:
-    import toml
-    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-    _CFG = toml.load(_PROJECT_ROOT / "pyproject.toml")
-    _BATCH_CFG = _CFG["tool"]["flwr"]["cluster"]["batch_sizes"]
-    LOGIT_BATCH_DEFAULT = int(_BATCH_CFG["logit_batch"])
-    FEATURE_BATCH_DEFAULT = int(_BATCH_CFG["feature_batch"])
-except Exception as e:  # pragma: no cover
-    raise KeyError(
-        "Missing required [tool.flwr.cluster.batch_sizes] configuration in pyproject.toml"
-    ) from e
+    _BATCH_CFG = _load_batch_cfg()
+except Exception:
+    warn("flwr cluster.batch_sizes missing; using defaults")
+    _BATCH_CFG = {}
+
+# Normalize defaults so downstream code always has these keys.
+_BATCH_CFG = {
+    "client": int(_BATCH_CFG.get("client", 32)),
+    "server": int(_BATCH_CFG.get("server", 32)),
+    "cloud": int(_BATCH_CFG.get("cloud", 32)),
+    "batch": int(_BATCH_CFG.get("batch", 32)),
+    "feature_batch": int(_BATCH_CFG.get("feature_batch", 32)),
+}
+
+BATCH_DEFAULT = _BATCH_CFG["batch"]
+FEATURE_BATCH_DEFAULT = _BATCH_CFG["feature_batch"]
+LOGIT_BATCH_DEFAULT = _BATCH_CFG.get("batch", 32)
+
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------\n
+# --- safe normalization override (idempotent) ---
+try:
+    _BATCH_CFG  # noqa: F401
+except NameError:
+    from ._batch_cfg_loader import load as _load_batch_cfg
+    _BATCH_CFG = _load_batch_cfg()
+
+# normalize defaults to ensure downstream constants always exist
+_BATCH_CFG = {
+    "client": int(_BATCH_CFG.get("client", 32)),
+    "server": int(_BATCH_CFG.get("server", 32)),
+    "cloud": int(_BATCH_CFG.get("cloud", 32)),
+    "batch": int(_BATCH_CFG.get("batch", 32)),
+    "feature_batch": int(_BATCH_CFG.get("feature_batch", 32)),
+}
+BATCH_DEFAULT = _BATCH_CFG["batch"]
+FEATURE_BATCH_DEFAULT = _BATCH_CFG["feature_batch"]
+LOGIT_BATCH_DEFAULT = _BATCH_CFG.get("batch", 32)
 
 # ----------------------------------------------------------------------------
 # 1.  Public reference set loader
@@ -47,15 +66,12 @@ def _hash_dataset(ds) -> str:
         h.update(int(lbl).to_bytes(2, byteorder="little", signed=False))
     return h.hexdigest()
 
-
-
 # ----------------------------------------------------------------------------
 # 2.  Symmetric KL divergence helpers
 # ----------------------------------------------------------------------------
 
 def _safe_softmax(logits: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.softmax(logits, dim=-1).clamp_min_(eps)
-
 
 def sym_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-6) -> float:
     """Stable symmetric KL on two 1-D probability vectors."""
@@ -64,7 +80,6 @@ def sym_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-6) -> float:
     kl_pq = (p * (np.log(p) - np.log(q))).sum()
     kl_qp = (q * (np.log(q) - np.log(p))).sum()
     return float(0.5 * (kl_pq + kl_qp))
-
 
 def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-6) -> float:
     """Jensen-Shannon divergence between two probability distributions."""
@@ -77,7 +92,7 @@ def js_divergence(p: np.ndarray, q: np.ndarray, eps: float = 1e-6) -> float:
 # 3.  Distance matrix and clustering
 # ----------------------------------------------------------------------------
 
-def extract_logits(model: Net, imgs: torch.Tensor, batch_size: int | None = None, device: str = "cpu") -> np.ndarray:
+def extract_logits(model: "Net", imgs: torch.Tensor, batch_size: int | None = None, device: str = "cpu") -> np.ndarray:
     """Run *model* on *imgs* and return the mean logits as a NumPy vector."""
     model.eval()
     model.to(device)
@@ -90,7 +105,7 @@ def extract_logits(model: Net, imgs: torch.Tensor, batch_size: int | None = None
     logits = torch.cat(logits_accum, dim=0).mean(dim=0)  # (num_classes,)
     return logits.numpy(force=True) if hasattr(logits, "numpy") else logits.numpy()
 
-def extract_probs(model: Net, imgs: torch.Tensor, batch_size: int | None = None, device: str = "cpu") -> np.ndarray:
+def extract_probs(model: "Net", imgs: torch.Tensor, batch_size: int | None = None, device: str = "cpu") -> np.ndarray:
     """Run *model* on *imgs* and return the mean probabilities as a NumPy vector."""
     model.eval()
     model.to(device)
@@ -102,8 +117,6 @@ def extract_probs(model: Net, imgs: torch.Tensor, batch_size: int | None = None,
             probs_accum.append(torch.softmax(model(batch).cpu(), dim=-1))
     probs = torch.cat(probs_accum, dim=0).mean(dim=0)  # (num_classes,)
     return probs.numpy(force=True) if hasattr(probs, "numpy") else probs.numpy()
-
-
 
 def distance_matrix(
     probs_list: List[np.ndarray],
@@ -133,7 +146,6 @@ def distance_matrix(
             d = dist_fn(probs_list[i], probs_list[j])
             D[i, j] = D[j, i] = d
     return D
-
 
 def connected_components_from_adj(A: np.ndarray) -> np.ndarray:
     """Find connected components from adjacency matrix using simple BFS.
@@ -166,7 +178,6 @@ def connected_components_from_adj(A: np.ndarray) -> np.ndarray:
         current_label += 1
         
     return labels
-
 
 def flatten_last_layer(weights: List[np.ndarray]) -> np.ndarray:
     """Extract and flatten the last layer weights (Linear layer: weight only, no bias).
@@ -202,9 +213,7 @@ def flatten_last_layer(weights: List[np.ndarray]) -> np.ndarray:
     # Return only the weight, no bias
     return weights[fc_w_idx].ravel()
 
-
 # Remove metadata_based_clustering - not needed for dynamic weight-based clustering
-
 
 def cifar10_weight_clustering(
     server_weights_list: List[List[np.ndarray]], 
@@ -282,9 +291,6 @@ def cifar10_weight_clustering(
     
     return labels, S, tau
 
-
-
-
 def compute_gradient_similarity(weights1: List[np.ndarray], weights2: List[np.ndarray], 
                                global_weights: List[np.ndarray]) -> float:
     """Compute cosine similarity between gradient directions."""
@@ -301,12 +307,12 @@ def compute_gradient_similarity(weights1: List[np.ndarray], weights2: List[np.nd
     
     return dot_product / (norms + 1e-8)
 
-
 # ----------------------------------------------------------------------------
 # 4.  Rebuild model from raw NumPy weight list (helper for cloud server)
 # ----------------------------------------------------------------------------
 
-def rebuild_model_from_weights(weights: List[np.ndarray]) -> Net:
+def rebuild_model_from_weights(weights: List[np.ndarray]) -> "Net":
+    from fedge.task import Net, set_weights
     model = Net()
     set_weights(model, weights)
     return model

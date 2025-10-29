@@ -26,68 +26,77 @@ dependencies = [
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 
-# Core Hierarchical FL Configuration
+# ------------------------------------------------------------
+# Core Hierarchical FL Configuration (names leaf_server expects)
+# ------------------------------------------------------------
 [tool.flwr.hierarchy]
-num_servers = 3
-clients_per_server = [5, 5, 5]
+# Topology (env can override at launch)
+num_servers = 2
+clients_per_server = [10, 10]
 global_rounds = 150
 server_rounds_per_global = 1
 cloud_port = 6000
 server_base_port = 5000
-weight_decay = 0.0001
-clip_norm = 1.0
-momentum = 0.9
-lr_gamma = 0.99
-prox_mu = 0.001
-prox_mu_min = 0.0001
-acc_stable_threshold = 0.002
-loss_delta = 0.002
 
-# Dataset
-dataset_flag = "cifar10"
-
-# SCAFFOLD + FedProx parameters
-scaffold_enabled = true
-
-# Learning parameters
-lr_init = 0.01
+# Training knobs (no duplicates; all have sane defaults)
+local_epochs = 1
+lr_init = 0.01        # client LR (env LR_INIT overrides if set)
 server_lr = 1.0
 global_lr = 1.0
-local_epochs = 1
-es_delta = 0.001
-es_patience = 5
+weight_decay = 0.0005
+momentum = 0.9
+clip_norm = 1.0
+lr_gamma = 1.0
 
-# Accuracy gate (0.0 = accept all improvements)
+# FedProx / stability gates
+prox_mu = 0.0
+prox_mu_min = 0.0
+acc_stable_threshold = 0.0
+loss_delta = 0.0
+
+# SCAFFOLD switch (server-side implementation)
+scaffold_enabled = true
+
+# Evaluation / batch sizes used by leaf/cloud
+eval_batch_size = 128
 cluster_better_delta = 0.0
 
-# Evaluation
-eval_batch_size = 32
-estimation_batch_size = 32
+# Dataset flag used by your codepaths
+dataset_flag = "cifar10"
 
-# Dirichlet Partitioning
+# Dirichlet Partitioning (kept; used by your partitioner)
 [tool.flwr.hierarchy.dirichlet]
-alpha_server = 10.0  # Higher alpha = more balanced server distributions
-alpha_client = 0.7  # Higher alpha = more balanced client distributions  
-seed         = 123   # Different seed for more balanced sample allocation
+alpha_server = 10.0
+alpha_client = 0.7
+seed = 123
 
-
-# Cloud Clustering Configuration
+# ------------------------------------------------------------
+# Cloud clustering knobs (read by cloud_flower.py)
+# ------------------------------------------------------------
 [tool.flwr.cloud_cluster]
 enable = true
-start_round = 1                  # clustering begins from round 3 (after stabilization)
-frequency = 1                    # cluster every cloud round
-method = "cosine_similarity"     # Pure cosine similarity clustering (no agglomerative)
-tau = 0.01                       # Similarity threshold: merge if abs(cosine_sim) >= tau
+start_round = 1
+frequency = 1
+method = "cosine_similarity"
+tau = 0.01
 
-# System Configuration
-[tool.flwr.cluster.batch_sizes]
-logit_batch = 256
-feature_batch = 256
+# (cloud_flower.py currently reads `[tool.flwr.cluster]` too;
+# keep an empty section to avoid key errors in some variants)
+[tool.flwr.cluster]
 
+# ------------------------------------------------------------
+# System/Runtime
+# ------------------------------------------------------------
 [tool.flwr.system]
 max_workers = 4
 log_level = "INFO"
 communication_timeout = 300
-max_retries          = 3
-gc_frequency         = 10
-verbose_logging      = true
+max_retries = 3
+gc_frequency = 10
+verbose_logging = true
+
+# Batch sizes mapping retained for any helper utilities
+[tool.flwr.cluster.batch_sizes]
+client = 32
+server = 32
+cloud  = 32

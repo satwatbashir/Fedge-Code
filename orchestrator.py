@@ -372,65 +372,82 @@ def kill_processes_on_ports(ports: List[int]) -> None:
 
 
 def cleanup_processes() -> None:
-    """Terminate any still-running child processes and ensure ports are released.
-    NOTE: Does NOT terminate the long-running cloud server.
-    """
-    # First, collect all ports that should be freed
-    ports_to_free = []
-    for sid in range(NUM_SERVERS):
-        ports_to_free.append(SERVER_BASE_PORT + sid)
-    
-    # Terminate our tracked processes (EXCEPT cloud server)
-    for name, proc in active_processes:
-        if proc.poll() is None:
-            # Skip terminating the long-running cloud server
-            if name == "cloud_server":
-                logger.debug(f"Keeping long-running {name} (pid={proc.pid}) alive")
-                continue
-            logger.info(f"Terminating {name} (pid={proc.pid})")
+    """Cleanly terminate or reap all subprocesses to avoid zombie processes."""
+    import subprocess, psutil, os
+
+    try:
+        tracked_lists = [
+            leaf_client_procs,
+            proxy_client_procs,
+            leaf_server_procs,
+            active_processes,
+        ]
+
+        # 1. Terminate running children
+        for plist in tracked_lists:
+            for _, proc in list(plist):
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        # 2. Reap already-exited ones (no zombies)
+        for plist in tracked_lists:
+            for key, proc in list(plist):
+                try:
+                    if proc.poll() is not None:
+                        proc.wait(timeout=0)
+                    plist.remove((key, proc))
+                except Exception:
+                    pass
+
+        # 3. Reap any stray children (grandchildren)
+        try:
+            parent = psutil.Process(os.getpid())
+            for child in parent.children(recursive=True):
+                try:
+                    if not child.is_running():
+                        child.wait(timeout=0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 4. Close open log handles
+        for pid, (out_fh, err_fh) in list(LOG_HANDLES.items()):
             try:
-                proc.terminate()
-            except Exception:  # pragma: no cover
-                pass
-    
-    # Wait a bit for graceful termination
-    time.sleep(2.0)
-    
-    # Force kill any remaining processes (EXCEPT cloud server)
-    for name, proc in active_processes:
-        if proc.poll() is None:
-            # Skip force-killing the long-running cloud server
-            if name == "cloud_server":
-                continue
-            logger.info(f"Force killing {name} (pid={proc.pid})")
+                if out_fh and not out_fh.closed:
+                    out_fh.close()
+                if err_fh and not err_fh.closed:
+                    err_fh.close()
+            finally:
+                LOG_HANDLES.pop(pid, None)
+
+        # 5. Kill any stray processes still holding ports
+        try:
+            kill_processes_on_ports(list(SERVER_PORTS.values()) + [HIER.get("cloud_port", 6000)])
+        except Exception:
+            pass
+
+    finally:
+        # clear global tracking lists
+        for plist in [leaf_client_procs, proxy_client_procs, leaf_server_procs, active_processes]:
             try:
-                proc.kill()
+                plist.clear()
             except Exception:
                 pass
-    
-    # Kill any processes still using our ports
-    kill_processes_on_ports(ports_to_free)
-    
-    # Wait for ports to be released
-    for port in ports_to_free:
-        wait_for_port_release(port, timeout=10)
-    
-    # Clear all process lists
-    active_processes.clear()
-    leaf_server_procs.clear()
-    leaf_client_procs.clear()
-    proxy_client_procs.clear()
-    # Close any remaining log handles
-    for pid, (out_fh, err_fh) in list(LOG_HANDLES.items()):
-        try:
-            if not out_fh.closed:
-                out_fh.close()
-        finally:
-            if not err_fh.closed:
-                err_fh.close()
-        LOG_HANDLES.pop(pid, None)
-    
-    logger.info("Process cleanup completed")
+
+
+
+
 ################################################################################
 #  end of chunk 1  ─────────────────────────────────────────────────────────────
 ################################################################################
@@ -451,9 +468,12 @@ def cleanup_processes() -> None:
 PACKAGE_DIR          = PROJECT_ROOT / "fedge"
 SERVER_BASE_PORT     = HIER.get("server_base_port", 5000)  # Read from TOML, fallback to 5000
 SERVER_START_STAGGER = {0: 2, 1: 4, 2: 6}          # seconds - reduced from 15-35s to prevent timeout issues
-MAX_WAIT_SEC_LEAF    = SERVER_ROUNDS_PER_GLOBAL * 900 + 180   # generous buffer
-MAX_WAIT_SEC_PROXY   = 600
-MAX_WAIT_SEC_CLOUD   = GLOBAL_ROUNDS * SERVER_ROUNDS_PER_GLOBAL * 900 + 180
+# --- Dynamic wait: no fixed timeout ---
+# Orchestrator will move on as soon as all servers finish
+MAX_WAIT_SEC_LEAF  = None   # None → wait indefinitely until all leaf servers signal done
+MAX_WAIT_SEC_PROXY = None   # same for proxies
+MAX_WAIT_SEC_CLOUD = None   # same for cloud aggregation
+
 
 # Early-stopping / LR-on-plateau - require explicit TOML values
 if "es_patience" not in HIER:
@@ -696,30 +716,42 @@ def launch_leaf_servers(global_round: int, prev_local_rounds: int) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 #  4) Wait helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def _wait(procs: List[Tuple[int, _sp.Popen]], label: str, timeout: int) -> Tuple[set[int], set[int]]:
-    """Wait for processes and return (successful_pids, failed_pids)."""
+def _wait(procs: List[Tuple[int, _sp.Popen]], label: str, timeout: int | None) -> Tuple[set[int], set[int]]:
+    """Wait for processes to finish; timeout=None means wait indefinitely."""
     logger.info(f"⏳ Waiting for all {label} to finish …")
     done: set[int] = set()
     failed: set[int] = set()
     start = time.time()
-    while len(done) + len(failed) < len(procs) and (time.time() - start) < timeout:
+    while len(done) + len(failed) < len(procs):
         for pid, proc in procs:
             if pid in done or pid in failed:
                 continue
             if proc.poll() is not None:
+                # ✅ CRITICAL FIX: Reap process immediately to prevent zombie
+                try:
+                    proc.wait(timeout=0)
+                except Exception:
+                    pass
+                
                 if proc.returncode == 0:
                     logger.info(f"✅ {label.capitalize()} {pid} exited successfully (code {proc.returncode})")
                     done.add(pid)
                 else:
                     logger.error(f"❌ {label.capitalize()} {pid} failed (code {proc.returncode})")
                     failed.add(pid)
-        time.sleep(1)
-    if len(done) + len(failed) < len(procs):
-        logger.warning(f"Timeout waiting for {label}.   finished={len(done) + len(failed)}/{len(procs)}")
-    return done, failed
 
 
- 
+
+def _reap_finished():
+    """Reap finished client and proxy processes after each wait."""
+    for plist in (leaf_client_procs, proxy_client_procs):
+        for _, proc in list(plist):
+            if proc.poll() is not None:
+                try:
+                    proc.wait(timeout=0)
+                except Exception:
+                    pass
+
 
 
 
@@ -843,6 +875,12 @@ def wait_for_proxy_clients() -> bool:
             if server_id in completed or server_id in failed:
                 continue
             if proc.poll() is not None:
+                # ✅ CRITICAL FIX: Reap process immediately to prevent zombie
+                try:
+                    proc.wait(timeout=0)
+                except Exception:
+                    pass
+                
                 if proc.returncode == 0:
                     logger.info(f"✅ Proxy client {server_id} completed successfully (code {proc.returncode})")
                     completed.add(server_id)
@@ -874,6 +912,7 @@ def wait_for_leaf_servers(global_round: int) -> Tuple[set[int], set[int]]:
 
      # 1) Wait for subprocess exit across all servers
      done, failed = _wait(leaf_server_procs, "leaf server", MAX_WAIT_SEC_LEAF)
+     _reap_finished()
 
      # 2) After processes finish, wait briefly for expected signal files
      round_sig_dir = get_round_signals_dir(PROJECT_ROOT, global_round)

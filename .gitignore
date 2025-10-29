@@ -1,37 +1,8 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
-
-# Virtual env / IDE
-.venv/
-venv/
-.env
-.vscode/
-.idea/
-
-# Data & artifacts
-data/
-datasets/
-*.tar
-*.tar.gz
-*.zip
-*.pth
-*.pt
-*.onnx
-
-# Runtime/output
-metrics/
-models/
-rounds/
-logs/
-*.log
-server*.log*
-client*.log*
-*.csv
-*.tmp
-
-# Checkpoints / notebooks
+.venv/ venv/ .env
+.vscode/ .idea/
+data/ datasets/
+metrics/ models/ rounds/ logs/ *.log
+*.tar *.tar.gz *.zip *.pth *.pt *.onnx
 *.ipynb_checkpoints/
